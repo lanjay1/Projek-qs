@@ -1,0 +1,1454 @@
+// Include necessary libraries
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <FastLED.h>
+#include <ArduinoJson.h>
+#include "esp_task_wdt.h"
+#include <ESP32Servo.h>
+#include <EEPROM.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+// Pin Definitions
+#define RELAY_1_PIN 25
+#define RELAY_2_PIN 26
+#define LED_PIN 27
+#define NUM_LEDS 8
+#define SERVO_PIN 13
+#define RPM_INPUT_PIN 34
+#define SHIFTER_UP_PIN 35
+#define SHIFTER_DOWN_PIN 32
+#define IGNITION_CUT_PIN 33
+#define BUTTON_PIN 14
+#define SENSOR_LED_PIN 15
+#define WARMUP_SERVO_PIN 12
+#define WARMUP_ANGLE 45
+
+// FastLED specific definitions
+#define LED_TYPE WS2812B
+#define COLOR_ORDER GRB
+CRGB leds[NUM_LEDS];
+
+// EEPROM Configuration
+#define EEPROM_SIZE 1024
+#define EEPROM_START_ADDR 0
+
+// WiFi Configuration
+const char* AP_SSID = "SWARGANUKA";
+const char* AP_PASSWORD = "123456789";
+IPAddress local_IP(192, 168, 4, 1);
+IPAddress gateway(192, 168, 4, 1);
+IPAddress subnet(255, 255, 255, 0);
+class ConnectionStatus;
+// LED Mode enum
+enum LedMode {
+    STATIC_COLOR,
+    RAINBOW,
+    WAVE,
+    BREATHING,
+    THEATER_CHASE,
+    BLINK
+};
+class ConnectionStatus {
+public:
+    bool isConnected = false;
+    unsigned long lastPing = 0;
+    unsigned long lastPong = 0;
+    uint32_t messageCount = 0;
+
+    // Default constructor
+    ConnectionStatus() = default;
+};
+void updateClientStatus(uint32_t clientId, bool connected, bool isPong = false);
+
+// Global array declaration after ConnectionStatus class definition
+ConnectionStatus clientStatus[8];
+
+// System State Structure
+struct SystemState {
+    // LED and Relay Status
+    bool relay1State = false;
+    bool relay2State = false;
+    bool ledStripState = true;
+    CRGB currentColor = CRGB::Red;  
+    LedMode currentMode = STATIC_COLOR;
+    uint8_t effectSpeed = 5;
+    uint16_t phase = 0;
+    uint8_t brightness = 128;
+    
+    // System Status
+    bool wifiEnabled = true;
+    bool autoWarmupActive = false;
+    unsigned long buttonPressStart = 0;
+    bool buttonPressed = false;
+    bool sensorLedState = false;
+    // Fungsi untuk memeriksa jumlah client aktif
+    
+    // Quickshifter Status
+    uint16_t currentRPM = 0;
+    uint16_t cutoffTimes[5] = {110, 90, 80, 70, 60};
+    uint8_t sensUp = 50;
+    uint8_t sensDown = 50;
+    uint16_t pitLimiterRPM = 5000;
+    uint16_t launchRPM = 10000;
+    uint16_t launchDelay = 0;
+    uint8_t blipTime = 100;
+    uint8_t blipAngle = 15;
+    bool launchControlActive = false;
+    bool pitLimiterActive = false;
+    
+    // Runtime Variables
+    unsigned long lastShiftTime = 0;
+    unsigned long lastRPMUpdate = 0;
+    int rpmBuffer[10];
+    uint8_t rpmBufferIndex = 0;
+    Servo warmupServo;
+    unsigned long warmupStartTime = 0;
+    bool warmupServoAttached = false;
+};
+uint8_t getActiveClients() {
+    uint8_t count = 0;
+    for (int i = 0; i < 8; i++) {
+        if (clientStatus[i].isConnected) count++;
+    }
+    return count;
+}
+struct RateLimiter {
+    uint32_t lastRequestTime = 0;
+    uint16_t requestCount = 0;
+};
+RateLimiter rateLimiters[8];  
+bool checkRateLimit(IPAddress clientIP) {
+    // Get index based on last octet of IP
+    int index = clientIP[3] % 8;
+    uint32_t currentTime = millis();
+    
+    // Reset counter if a second has passed
+    if (currentTime - rateLimiters[index].lastRequestTime > 1000) {
+        rateLimiters[index].requestCount = 0;
+        rateLimiters[index].lastRequestTime = currentTime;
+    }
+    
+    // Increment counter
+    rateLimiters[index].requestCount++;
+    
+    // Return true if within rate limit
+    return rateLimiters[index].requestCount <= 100;  // 100 requests per second limit
+}
+
+// Global variables
+SystemState systemState;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+SemaphoreHandle_t systemStateMutex = NULL;
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MBR Quick Shifter & Kontrol LED</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        /* Reset dan Dasar */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+        
+        body { 
+            background: #f0f0f0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        /* Container Utama */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        /* Bagian-bagian */
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            border-radius: 10px;
+            background: #fff;
+            transition: box-shadow 0.3s ease;
+        }
+        
+        .section:hover {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        /* Grid Layout */
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        /* Heading */
+        h1 { 
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        h2 {
+            color: #444;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        
+        /* Form Elements */
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: bold;
+        }
+        
+        input[type="number"],
+        input[type="range"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+        }
+        
+        input[type="number"]:focus,
+        input[type="range"]:focus {
+            border-color: #2196F3;
+            outline: none;
+        }
+        
+        /* Value Display */
+        .value-display {
+            font-size: 0.9em;
+            color: #666;
+            text-align: right;
+            margin-top: 5px;
+        }
+        
+        /* Buttons */
+        button {
+            background: #2196F3;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            min-width: 150px;
+            margin: 5px;
+        }
+        
+        button:hover {
+            background: #1976D2;
+            transform: translateY(-2px);
+        }
+        
+        button.active {
+            background: #4CAF50;
+        }
+        
+        /* RPM Gauge */
+        .rpm-gauge {
+            text-align: center;
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #2196F3;
+            background: linear-gradient(145deg, #ffffff, #f0f0f0);
+            padding: 30px;
+            border-radius: 50%;
+            width: 200px;
+            height: 200px;
+            line-height: 140px;
+            margin: 30px auto;
+            box-shadow: 
+                8px 8px 16px #d1d1d1,
+                -8px -8px 16px #ffffff;
+        }
+        
+        .rpm-gauge::after {
+            content: 'RPM';
+            display: block;
+            font-size: 0.4em;
+            line-height: 1;
+            color: #666;
+            margin-top: -30px;
+        }
+        
+        /* LED Controls */
+        .led-controls {
+            background: #f8f8f8;
+            padding: 20px;
+            border-radius: 10px;
+        }
+        
+        /* Switches */
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+        
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+        
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+        
+        input:checked + .slider {
+            background-color: #2196F3;
+        }
+        
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+        
+        /* Color Picker */
+        input[type="color"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 50px;
+            border: none;
+            border-radius: 8px;
+            padding: 0;
+            cursor: pointer;
+        }
+        
+        input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+        
+        input[type="color"]::-webkit-color-swatch {
+            border: none;
+            border-radius: 8px;
+        }
+        
+        /* Responsif */
+        @media (max-width: 768px) {
+            .container {
+                padding: 10px;
+            }
+            
+            .grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .rpm-gauge {
+                width: 150px;
+                height: 150px;
+                font-size: 2em;
+                line-height: 105px;
+            }
+            
+            button {
+                width: 100%;
+                margin: 5px 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MBR Quick Shifter & Kontrol LED</h1>
+        
+        <!-- RPM Display -->
+        <div class="rpm-gauge">
+            <span id="rpmValue">0</span>
+        </div>
+        
+        <div class="grid">
+            <!-- Quick Shifter Controls -->
+            <div class="section">
+                <h2>Pengaturan Cut-off</h2>
+                <div class="input-group">
+                    <label>3000-6000 RPM (ms)</label>
+                    <input type="number" id="cutoff1" min="60" max="200" value="110" 
+                           onchange="updateCutoff(0, this.value)">
+                </div>
+                <div class="input-group">
+                    <label>6000-9000 RPM (ms)</label>
+                    <input type="number" id="cutoff2" min="60" max="200" value="90"
+                           onchange="updateCutoff(1, this.value)">
+                </div>
+                <div class="input-group">
+                    <label>9000-12000 RPM (ms)</label>
+                    <input type="number" id="cutoff3" min="60" max="200" value="80"
+                           onchange="updateCutoff(2, this.value)">
+                </div>
+                <div class="input-group">
+                    <label>12000-15000 RPM (ms)</label>
+                    <input type="number" id="cutoff4" min="60" max="200" value="70"
+                           onchange="updateCutoff(3, this.value)">
+                </div>
+                <div class="input-group">
+                    <label>>15000 RPM (ms)</label>
+                    <input type="number" id="cutoff5" min="60" max="200" value="60"
+                           onchange="updateCutoff(4, this.value)">
+                </div>
+            </div>
+
+            <!-- LED Controls -->
+            <div class="section led-controls">
+                <h2>Kontrol LED</h2>
+                <div class="input-group">
+                    <label>Warna:</label>
+                    <input type="color" id="colorPicker" value="#ff0000">
+                </div>
+                <div class="input-group">
+                    <button id="staticMode">Warna Statis</button>
+                    <button id="rainbowMode">Efek Pelangi</button>
+                    <button id="waveMode">Efek Gelombang</button>
+                    <button id="breathingMode">Efek Nafas</button>
+                    <button id="blinkMode">Kedip</button>
+                    <button id="theaterMode">Kejar-kejaran</button>
+                </div>
+                <div class="input-group">
+                    <label>Kecepatan Efek</label>
+                    <input type="range" id="effectSpeed" min="1" max="10" value="5">
+                    <div class="value-display">
+                        <span id="speedValue">5</span>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>LED Strip</label>
+                    <label class="switch">
+                        <input type="checkbox" id="ledStrip" checked>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Relay Controls -->
+            <div class="section">
+                <h2>Kontrol Relay</h2>
+                <button id="relay1">Relay 1</button>
+                <button id="relay2">Relay 2</button>
+            </div>
+
+            <!-- Shifter Sensitivity -->
+            <div class="section">
+                <h2>Sensitivitas Perpindahan</h2>
+                <div class="input-group">
+                    <label>Sensitivitas Naik Gigi (%)</label>
+                    <input type="range" id="sensUp" min="0" max="100" value="50"
+                           oninput="updateSensitivity('up', this.value)">
+                    <div class="value-display">
+                        <span id="sensUpValue">50%</span>
+                    </div>
+                </div>
+                <div class="input-group">
+                    <label>Sensitivitas Turun Gigi (%)</label>
+                    <input type="range" id="sensDown" min="0" max="100" value="50"
+                           oninput="updateSensitivity('down', this.value)">
+                    <div class="value-display">
+                        <span id="sensDownValue">50%</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Launch Control -->
+            <div class="section">
+                <h2>Launch Control</h2>
+                <div class="input-group">
+                    <label>RPM Launch</label>
+                    <input type="number" id="launchRpm" min="5000" max="15000" value="10000"
+                           onchange="updateLaunchControl()">
+                </div>
+                <div class="input-group">
+                    <label>Delay Launch (ms)</label>
+                    <input type="number" id="launchDelay" min="0" max="1000" value="0"
+                           onchange="updateLaunchControl()">
+                </div>
+                <button id="launchControl" onclick="toggleLaunch()">Aktifkan Launch Control</button>
+            </div>
+
+            <!-- Pit Limiter -->
+            <div class="section">
+                <h2>Pembatas Pit</h2>
+                <div class="input-group">
+                    <label>RPM Maksimum Pit</label>
+                    <input type="number" id="pitRpm" min="2000" max="8000" value="5000"
+                           onchange="updatePitLimiter()">
+                </div>
+                <button id="pitLimiter" onclick="togglePitLimiter()">Aktifkan Pembatas Pit</button>
+            </div>
+
+            <!-- Blipper Settings -->
+            <div class="section">
+                <h2>Pengaturan Blipper</h2>
+                <div class="input-group">
+                    <label>Waktu Blip (ms)</label>
+                    <input type="number" id="blipTime" min="50" max="200" value="100"
+                           onchange="updateBlipperSettings()">
+                </div>
+                <div class="input-group">
+                    <label>Sudut Servo (derajat)</label>
+                    <input type="number" id="blipAngle" min="5" max="45" value="15"
+                           onchange="updateBlipperSettings()">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        // Fungsi koneksi WebSocket
+        function connect() {
+            ws = new WebSocket(`ws://${window.location.hostname}/ws`);
+            
+            ws.onopen = function() {
+                console.log('Terhubung ke perangkat');
+                reconnectAttempts = 0;
+                updateConnectionStatus(true);
+            };
+
+            ws.onclose = function() {
+                console.log('Koneksi terputus');
+                updateConnectionStatus(false);
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    setTimeout(connect, 2000);
+                    reconnectAttempts++;
+                }
+            };
+
+            ws.onerror = function() {
+                console.log('Error koneksi WebSocket');
+                updateConnectionStatus(false);
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                if (data.type === 'statusUpdate') {
+                    updateStatus(data);
+                }
+            };
+        }
+
+        // Update status koneksi
+        function updateConnectionStatus(connected) {
+            const statusEl = document.createElement('div');
+            statusEl.style</antArtifact>
+                    const modeButtons = {
+            'staticMode': 'STATIC',
+            'rainbowMode': 'RAINBOW',
+            'waveMode': 'WAVE',
+            'breathingMode': 'BREATHING',
+            'blinkMode': 'BLINK',
+            'theaterMode': 'THEATER'
+        };
+
+        Object.entries(modeButtons).forEach(([buttonId, mode]) => {
+            document.getElementById(buttonId).addEventListener('click', function() {
+                ws.send(JSON.stringify({
+                    type: 'ledMode',
+                    mode: mode
+                }));
+                
+                // Update active button
+                Object.keys(modeButtons).forEach(id => {
+                    document.getElementById(id).classList.remove('active');
+                });
+                this.classList.add('active');
+            });
+        });
+
+        // Relay buttons
+        ['relay1', 'relay2'].forEach(id => {
+            document.getElementById(id).addEventListener('click', function() {
+                ws.send(JSON.stringify({
+                    type: 'relay',
+                    relay: parseInt(id.slice(-1))
+                }));
+            });
+        });
+
+        // Inisialisasi koneksi saat halaman dimuat
+        window.addEventListener('load', connect);
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// Tambahkan fungsi ini setelah deklarasi variabel global
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len) {
+    AwsFrameInfo *info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, data);
+        
+        if (error) {
+            Serial.println("deserializeJson() failed");
+            return;
+        }
+        if (len > 512) {
+            Serial.println("Message too long");
+            return;
+        }
+
+        if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+            String type = doc["type"].as<String>();
+            Serial.print("Message type: ");
+            Serial.println(type);
+
+            if (type == "color") {
+                // Convert hex color to RGB
+                uint32_t colorValue = doc["value"].as<uint32_t>();
+                systemState.currentColor = CRGB(
+                    (colorValue >> 16) & 0xFF,  // Red
+                    (colorValue >> 8) & 0xFF,   // Green
+                    colorValue & 0xFF           // Blue
+                );
+            }
+            else if (type == "ledMode") {
+                String mode = doc["mode"].as<String>();
+                if (mode == "STATIC") systemState.currentMode = STATIC_COLOR;
+                else if (mode == "RAINBOW") systemState.currentMode = RAINBOW;
+                else if (mode == "WAVE") systemState.currentMode = WAVE;
+                else if (mode == "BREATHING") systemState.currentMode = BREATHING;
+                else if (mode == "THEATER") systemState.currentMode = THEATER_CHASE;
+                else if (mode == "BLINK") systemState.currentMode = BLINK;
+            }
+            else if (type == "speed") {
+                systemState.effectSpeed = doc["value"].as<uint8_t>();
+            }
+            else if (type == "ledStrip") {
+                systemState.ledStripState = doc["value"].as<bool>();
+            }
+            else if (type == "relay") {
+                int relay = doc["relay"].as<int>();
+                bool state = doc["state"].as<bool>();
+                if (relay == 1) {
+                    systemState.relay1State = state;
+                    digitalWrite(RELAY_1_PIN, state);
+                } else if (relay == 2) {
+                    systemState.relay2State = state;
+                    digitalWrite(RELAY_2_PIN, state);
+                }
+            }
+            else if (type == "cutoff") {
+                int index = doc["index"].as<int>();
+                uint16_t value = doc["value"].as<uint16_t>();
+                if (index >= 0 && index < 5) {
+                    systemState.cutoffTimes[index] = value;
+                }
+            }
+            else if (type == "sensitivity") {
+                String direction = doc["direction"].as<String>();
+                uint8_t value = doc["value"].as<uint8_t>();
+                if (direction == "up") {
+                    systemState.sensUp = value;
+                } else if (direction == "down") {
+                    systemState.sensDown = value;
+                }
+            }
+            else if (type == "launch") {
+                systemState.launchRPM = doc["rpm"].as<uint16_t>();
+                systemState.launchDelay = doc["delay"].as<uint16_t>();
+                systemState.launchControlActive = doc["active"].as<bool>();
+            }
+            else if (type == "pit") {
+                systemState.pitLimiterRPM = doc["rpm"].as<uint16_t>();
+                systemState.pitLimiterActive = doc["active"].as<bool>();
+            }
+            else if (type == "blipper") {
+                systemState.blipTime = doc["time"].as<uint8_t>();
+                systemState.blipAngle = doc["angle"].as<uint8_t>();
+            }
+
+            xSemaphoreGive(systemStateMutex);
+            sendState();
+        }
+        else {
+            Serial.println("Failed to take mutex");
+        }
+    }
+}
+void initWebServer() {
+    // Initialize WebSocket
+    ws.onEvent(onEvent);
+    server.addHandler(&ws);
+    
+    // Main route - send HTML page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkRateLimit(request->client()->remoteIP())) {
+            request->send(429, "text/plain", "Too Many Requests");
+            return;
+        }
+        request->send(200, "text/html", INDEX_HTML);
+    });
+
+    // Status route - return system status in JSON
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkRateLimit(request->client()->remoteIP())) {
+            request->send(429, "text/plain", "Too Many Requests");
+            return;
+        }
+        
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        StaticJsonDocument<512> doc;
+        
+        doc["activeClients"] = getActiveClients();
+        doc["freeHeap"] = ESP.getFreeHeap();
+        doc["uptime"] = millis() / 1000;
+        doc["wifiEnabled"] = systemState.wifiEnabled;
+        
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Handler for API endpoints
+    server.on("/api/data", HTTP_POST, [](AsyncWebServerRequest *request) {
+        // Rate limit check
+        if (!checkRateLimit(request->client()->remoteIP())) {
+            request->send(429, "text/plain", "Too Many Requests");
+            return;
+        }
+        // Request will be handled in onRequestBody
+    });
+
+    // Error handling - route not found
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        if (!checkRateLimit(request->client()->remoteIP())) {
+            request->send(429, "text/plain", "Too Many Requests");
+            return;
+        }
+        request->send(404, "text/plain", "Not Found");
+    });
+
+    // Handler for request body data
+    server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        // Check if body size exceeds limit (16KB)
+        if (total > 16384) {
+            request->send(413, "text/plain", "Request Entity Too Large");
+            return;
+        }
+        
+        if (request->url() == "/api/data") {
+            StaticJsonDocument<512> doc;
+            DeserializationError error = deserializeJson(doc, data);
+            
+            if (error) {
+                request->send(400, "text/plain", "Bad Request");
+                return;
+            }
+            // Process data if needed
+        }
+    });
+
+    // Configure security headers
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    DefaultHeaders::Instance().addHeader("X-Content-Type-Options", "nosniff");
+    DefaultHeaders::Instance().addHeader("X-Frame-Options", "DENY");
+    DefaultHeaders::Instance().addHeader("X-XSS-Protection", "1; mode=block");
+
+    // Start server
+    server.begin();
+    Serial.println("Web server started on port 80");
+    
+    // Print info
+    Serial.print("Server URL: http://");
+    Serial.println(WiFi.softAPIP());
+    Serial.printf("Maximum simultaneous clients: %d\n", 8);
+}
+// Fungsi untuk memperbarui status server secara periodik
+void updateServerStatus() {
+    static unsigned long lastUpdate = 0;
+    const unsigned long UPDATE_INTERVAL = 5000; // Update setiap 5 detik
+    
+    if (millis() - lastUpdate >= UPDATE_INTERVAL) {
+        if (getActiveClients() > 0) { // Hanya kirim update jika ada client aktif
+            StaticJsonDocument<256> doc;
+            doc["type"] = "serverStatus";
+            doc["freeHeap"] = ESP.getFreeHeap();
+            doc["uptime"] = millis() / 1000;
+            doc["activeClients"] = getActiveClients();
+            doc["wifiStrength"] = WiFi.RSSI();
+            
+            String output;
+            serializeJson(doc, output);
+            ws.textAll(output);
+        }
+        lastUpdate = millis();
+    }
+}
+
+void sendState() {
+    if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+        StaticJsonDocument<512> doc;
+        doc["type"] = "statusUpdate";
+        doc["freeHeap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis() / 1000;
+        
+        // LED state
+        doc["ledStrip"] = systemState.ledStripState;
+        doc["ledMode"] = systemState.currentMode;
+        doc["color"] = systemState.currentColor;
+        doc["effectSpeed"] = systemState.effectSpeed;
+        
+        // Relay state
+        doc["relay1"] = systemState.relay1State;
+        doc["relay2"] = systemState.relay2State;
+        
+        // RPM and controls
+        doc["rpm"] = systemState.currentRPM;
+        
+        // Quickshifter settings
+        JsonArray cutoffTimes = doc.createNestedArray("cutoffTimes");
+        for (int i = 0; i < 5; i++) {
+            cutoffTimes.add(systemState.cutoffTimes[i]);
+        }
+        doc["sensUp"] = systemState.sensUp;
+        doc["sensDown"] = systemState.sensDown;
+        
+        // Launch control
+        doc["launchRPM"] = systemState.launchRPM;
+        doc["launchDelay"] = systemState.launchDelay;
+        doc["launchActive"] = systemState.launchControlActive;
+        
+        // Pit limiter
+        doc["pitRPM"] = systemState.pitLimiterRPM;
+        doc["pitActive"] = systemState.pitLimiterActive;
+        
+        // Blipper settings
+        doc["blipTime"] = systemState.blipTime;
+        doc["blipAngle"] = systemState.blipAngle;
+
+        String output;
+        serializeJson(doc, output);
+        ws.textAll(output);
+        
+        xSemaphoreGive(systemStateMutex);
+    }
+}
+void resetRateLimiters() {
+    for (int i = 0; i < 8; i++) {
+        rateLimiters[i].lastRequestTime = 0;
+        rateLimiters[i].requestCount = 0;
+    }
+}
+
+void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+             void *arg, uint8_t *data, size_t len) {
+    switch (type) {
+        case WS_EVT_CONNECT:
+            Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+            updateClientStatus(client->id(), true); // Update client status
+            sendState(); // Send initial state to the new client
+            break;
+            
+        case WS_EVT_DISCONNECT:
+            Serial.printf("WebSocket client #%u disconnected\n", client->id());
+            updateClientStatus(client->id(), false); // Update client status
+            break;
+            
+        case WS_EVT_DATA:
+            handleWebSocketMessage(arg, data, len); // Handle incoming data
+            break;
+            
+        case WS_EVT_PONG:
+            updateClientStatus(client->id(), true, true); // Update status on PONG
+            break;
+            
+        case WS_EVT_ERROR:
+            Serial.printf("WebSocket error #%u: %s\n", client->id(), (char *)data); // Print error message
+            break;
+    }
+}
+
+// Task untuk mengirim update status secara periodik
+void statusUpdateTask(void *parameter) {
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+        sendState();
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+void initializeClientStatus() {
+    for(int i = 0; i < 8; i++) {
+        clientStatus[i].isConnected = false;
+        clientStatus[i].lastPing = 0;
+        clientStatus[i].lastPong = 0;
+        clientStatus[i].messageCount = 0;
+    }
+}
+
+uint8_t getActiveClients() {
+    uint8_t count = 0;
+    for (int i = 0; i < 8; i++) {
+        if (clientStatus[i].isConnected) count++;
+    }
+    return count;
+}
+// Fungsi untuk memperbarui status koneksi client
+void updateClientStatus(uint32_t clientId, bool connected, bool isPong = false) {
+    for (int i = 0; i < 8; i++) {
+        if (connected && !clientStatus[i].isConnected) {
+            clientStatus[i].isConnected = true;
+            clientStatus[i].lastPing = millis();
+            clientStatus[i].messageCount = 0;
+            break;
+        } else if (!connected && clientStatus[i].isConnected) {
+            clientStatus[i].isConnected = false;
+        } else if (isPong && clientStatus[i].isConnected) {
+            clientStatus[i].lastPong = millis();
+        }
+    }
+}
+// RTOS handles
+TaskHandle_t ledTaskHandle = NULL;
+TaskHandle_t quickshifterTaskHandle = NULL;
+TaskHandle_t buttonTaskHandle = NULL;
+TaskHandle_t wifiTaskHandle = NULL;
+QueueHandle_t commandQueue = NULL;
+
+// Function declarations
+void updateLEDEffects() {
+    static unsigned long lastEffectUpdate = 0;
+    unsigned long currentMillis = millis();
+    
+    if (currentMillis - lastEffectUpdate < (11 - systemState.effectSpeed) * 5) {
+        return;
+    }
+    lastEffectUpdate = currentMillis;
+    
+    if (!systemState.ledStripState) {
+        FastLED.clear();
+        FastLED.show();
+        return;
+    }
+    
+    systemState.phase++;
+    if (systemState.phase > 255) systemState.phase = 0;
+    
+    switch (systemState.currentMode) {
+        case STATIC_COLOR:
+            fill_solid(leds, NUM_LEDS, systemState.currentColor);
+            break;
+            
+        case RAINBOW:
+            fill_rainbow(leds, NUM_LEDS, systemState.phase, 255/NUM_LEDS);
+            break;
+            
+        case WAVE:
+            for (int i = 0; i < NUM_LEDS; i++) {
+                float wave = sin((i + systemState.phase) * 0.3) + 1.0;
+                leds[i] = CRGB(
+                    systemState.currentColor.r * wave / 2,
+                    systemState.currentColor.g * wave / 2,
+                    systemState.currentColor.b * wave / 2
+                );
+            }
+            break;
+            
+        case BREATHING:
+            {
+                float breath = (exp(sin(systemState.phase * 0.05)) - 0.36787944) * 108.0;
+                CRGB breathColor = CRGB(
+                    systemState.currentColor.r * breath / 255,
+                    systemState.currentColor.g * breath / 255,
+                    systemState.currentColor.b * breath / 255
+                );
+                fill_solid(leds, NUM_LEDS, breathColor);
+            }
+            break;
+            
+        case THEATER_CHASE:
+            for (int i = 0; i < NUM_LEDS; i++) {
+                leds[i] = (i + systemState.phase) % 3 == 0 ? 
+                         systemState.currentColor : CRGB::Black;
+            }
+            break;
+            
+        case BLINK:
+            {
+                bool isOn = (systemState.phase / 32) % 2;
+                fill_solid(leds, NUM_LEDS, isOn ? systemState.currentColor : CRGB::Black);
+            }
+            break;
+    }
+    
+    FastLED.setBrightness(systemState.brightness);
+    FastLED.show();
+}
+
+void processQuickshifter() {
+    static bool lastUpState = HIGH;
+    static bool lastDownState = HIGH;
+    static unsigned long lastDebounceTime = 0;
+    unsigned long currentTime = millis();
+    
+    bool currentUpState = digitalRead(SHIFTER_UP_PIN);
+    bool currentDownState = digitalRead(SHIFTER_DOWN_PIN);
+    
+    // Update sensor LED
+    digitalWrite(SENSOR_LED_PIN, (currentUpState == LOW || currentDownState == LOW));
+    
+    // Update RPM
+    if (currentTime - systemState.lastRPMUpdate >= 100) {
+        int rawValue = analogRead(RPM_INPUT_PIN);
+        systemState.currentRPM = map(rawValue, 0, 4095, 0, 16000);
+        systemState.lastRPMUpdate = currentTime;
+    }
+    
+    // Handle shifter up
+    if (currentUpState != lastUpState) {
+        lastDebounceTime = currentTime;
+    }
+    
+    if ((currentTime - lastDebounceTime) > 50) {
+        if (currentUpState == LOW && lastUpState == HIGH) {
+            handleShifterUp();
+        }
+    }
+    
+    // Handle shifter down
+    if (currentDownState != lastDownState) {
+        lastDebounceTime = currentTime;
+    }
+    
+    if ((currentTime - lastDebounceTime) > 50) {
+        if (currentDownState == LOW && lastDownState == HIGH) {
+            handleShifterDown();
+        }
+    }
+    
+    lastUpState = currentUpState;
+    lastDownState = currentDownState;
+}
+
+void handleShifterUp() {
+    uint16_t cutTime;
+    if (systemState.currentRPM < 6000) cutTime = systemState.cutoffTimes[0];
+    else if (systemState.currentRPM < 9000) cutTime = systemState.cutoffTimes[1];
+    else if (systemState.currentRPM < 12000) cutTime = systemState.cutoffTimes[2];
+    else if (systemState.currentRPM < 15000) cutTime = systemState.cutoffTimes[3];
+    else cutTime = systemState.cutoffTimes[4];
+    
+    digitalWrite(IGNITION_CUT_PIN, HIGH);
+    delay(cutTime);
+    digitalWrite(IGNITION_CUT_PIN, LOW);
+}
+
+void handleShifterDown() {
+    blipperServo.write(systemState.blipAngle);
+    delay(systemState.blipTime);
+    blipperServo.write(0);
+}
+
+void handleMultiButton() {
+static unsigned long lastClickTime = 0;
+    static uint8_t clickCount = 0;
+    static const unsigned long MULTI_CLICK_TIME = 400;
+    static bool launchArmed = false;
+    static bool lastButtonState = HIGH;
+    bool currentButtonState = digitalRead(BUTTON_PIN);
+    unsigned long currentTime = millis();
+    
+    if (currentButtonState != lastButtonState) {
+        if (currentButtonState == LOW) {
+            systemState.buttonPressStart = currentTime;
+            systemState.buttonPressed = true;
+        } else {
+            unsigned long pressDuration = currentTime - systemState.buttonPressStart;
+            //double click pit limiter
+            if (pressDuration < 500) { // Penekanan singkat < 500ms
+        clickCount++;
+        
+        if (clickCount == 1) {
+            lastClickTime = currentTime;
+        } 
+        else if (clickCount == 2) {
+            if (currentTime - lastClickTime < MULTI_CLICK_TIME) {
+                systemState.pitLimiterActive = !systemState.pitLimiterActive;
+                // Aktivasi Launch Control
+                systemState.launchControlActive = true;
+                launchArmed = true;
+                
+                // Feedback visual - 3x kedip
+                for(int i=0; i<3; i++) {
+                digitalWrite(SENSOR_LED_PIN, HIGH);
+                delay(100);
+                digitalWrite(SENSOR_LED_PIN, LOW);
+            }
+            clickCount = 0;
+        }
+    }
+    //10detik auto warm 
+    if (pressDuration >= 10000) { // Auto warmup
+                systemState.autoWarmupActive = !systemState.autoWarmupActive;
+                if (systemState.autoWarmupActive) {
+                    systemState.warmupServo.attach(WARMUP_SERVO_PIN);
+                    systemState.warmupServo.write(WARMUP_ANGLE);
+                } else {
+                    systemState.warmupServo.write(0);
+                    systemState.warmupServo.detach();
+                }
+                //5detik untuk matikan wifi dan menonaktifkan wifi
+            } else if (pressDuration >= 5000) { // WiFi toggle
+                systemState.wifiEnabled = !systemState.wifiEnabled;
+                if (!systemState.wifiEnabled) WiFi.softAPdisconnect(true);
+                else WiFi.softAP(AP_SSID, AP_PASSWORD);
+                if (clickCount == 1 && (currentTime - lastClickTime > MULTI_CLICK_TIME)) {
+        clickCount = 0;
+    }
+            }
+            systemState.buttonPressed = false;
+        }
+    }
+    lastButtonState = currentButtonState;
+      
+    }
+}
+// Task definitions
+void ledTask(void *parameter) {
+  esp_task_wdt_add(NULL);
+    const TickType_t xFrequency = pdMS_TO_TICKS(20);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+  // Reset watchdog timer
+        esp_task_wdt_reset();
+        
+        if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+            updateLEDEffects();
+            xSemaphoreGive(systemStateMutex);
+        }
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+void quickshifterTask(void *parameter) {
+   esp_task_wdt_add(NULL);
+    const TickType_t xFrequency = pdMS_TO_TICKS(20);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+  // Reset watchdog timer
+        esp_task_wdt_reset();
+        
+        if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+          // Cek kondisi untuk reset launch control
+            if (systemState.launchControlActive) {
+                static bool wasLaunched = false;
+                
+                // Reset launch control setelah RPM naik dan turun
+                if (systemState.currentRPM > systemState.launchRPM) {
+                    wasLaunched = true;
+                }
+                if (wasLaunched && systemState.currentRPM < (systemState.launchRPM * 0.7)) {
+                    systemState.launchControlActive = false;
+                    wasLaunched = false;
+                    // Optional feedback
+                    digitalWrite(SENSOR_LED_PIN, HIGH);
+                    delay(50);
+                    digitalWrite(SENSOR_LED_PIN, LOW);
+                }
+            }
+                
+            processQuickshifter();
+            xSemaphoreGive(systemStateMutex);
+        }
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+void buttonTask(void *parameter) {
+esp_task_wdt_add(NULL);
+    const TickType_t xFrequency = pdMS_TO_TICKS(50);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    
+    while(1) {
+        // Reset watchdog timer
+        esp_task_wdt_reset();
+        
+        if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+            handleMultiButton();
+            xSemaphoreGive(systemStateMutex);
+        }
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+// Fungsi untuk memperbarui status koneksi client
+void updateClientStatus(uint32_t clientId, bool connected, bool isPong = false) {
+    for (int i = 0; i < 8; i++) {
+        if (connected && !clientStatus[i].isConnected) {
+            clientStatus[i].isConnected = true;
+            clientStatus[i].lastPing = millis();
+            clientStatus[i].messageCount = 0;
+            break;
+        } else if (!connected && clientStatus[i].isConnected) {
+            clientStatus[i].isConnected = false;
+        } else if (isPong && clientStatus[i].isConnected) {
+            clientStatus[i].lastPong = millis();
+        }
+    }
+}
+
+// Fungsi untuk mengirim status error ke client
+void sendErrorMessage(AsyncWebSocketClient * client, const char* message) {
+    StaticJsonDocument<128> doc;
+    doc["type"] = "error";
+    doc["message"] = message;
+    
+    String output;
+    serializeJson(doc, output);
+    client->text(output);
+}
+void setup() {
+    // Inisialisasi Serial untuk debugging
+    Serial.begin(115200);
+    Serial.println("Memulai sistem...");
+  // Initialize Watchdog Timer
+    #define WDT_TIMEOUT 8   // 8 detik timeout
+    if (esp_task_wdt_init(WDT_TIMEOUT, true) != ESP_OK) {
+        Serial.println("Failed to initialize WDT");
+    }
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        Serial.println("Failed to add current task to WDT");
+    }
+    for(int i = 0; i < 8; i++) {
+        clientStatus[i].isConnected = false;
+        clientStatus[i].lastPing = 0;
+        clientStatus[i].lastPong = 0;
+        clientStatus[i].messageCount = 0;
+    }
+
+    
+    // Inisialisasi EEPROM
+    EEPROM.begin(EEPROM_SIZE);
+    AsyncWebServer server(80);
+    
+    // Inisialisasi pin-pin GPIO
+    pinMode(RELAY_1_PIN, OUTPUT);
+    pinMode(RELAY_2_PIN, OUTPUT);
+    pinMode(SHIFTER_UP_PIN, INPUT_PULLUP);
+    pinMode(SHIFTER_DOWN_PIN, INPUT_PULLUP);
+    pinMode(IGNITION_CUT_PIN, OUTPUT);
+    pinMode(RPM_INPUT_PIN, INPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(SENSOR_LED_PIN, OUTPUT);
+    
+    // Set kondisi awal output
+    digitalWrite(RELAY_1_PIN, LOW);
+    digitalWrite(RELAY_2_PIN, LOW);
+    digitalWrite(IGNITION_CUT_PIN, LOW);
+    digitalWrite(SENSOR_LED_PIN, LOW);
+    
+    // Inisialisasi LED Strip
+    FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS)
+           .setCorrection(TypicalLEDStrip)
+           .setTemperature(UncorrectedTemperature);
+    FastLED.clear();
+    FastLED.show();
+    // Inisialisasi Servo
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    blipperServo.setPeriodHertz(50);
+    blipperServo.attach(SERVO_PIN, 500, 2400);
+    blipperServo.write(0);
+    
+    systemState.warmupServo.setPeriodHertz(50);
+    
+    // Inisialisasi WiFi
+    WiFi.softAP("SWARGANUKA", "12345678", 1, 0, 8); // Maksimal 8 klien
+    Serial.println("Memulai WiFi Access Point...");
+    WiFi.softAPConfig(local_IP, gateway, subnet);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+    
+    // Buat RTOS primitives
+    systemStateMutex = xSemaphoreCreateMutex();
+    commandQueue = xQueueCreate(10, sizeof(uint32_t));
+    
+    // Inisialisasi WebServer dan WebSocket
+    initWebServer();
+    
+    // Buat RTOS tasks
+    xTaskCreatePinnedToCore(
+        ledTask,
+        "LED_Task",
+        4096,
+        NULL,
+        1,
+        &ledTaskHandle,
+        0
+    );
+    
+    xTaskCreatePinnedToCore(
+        quickshifterTask,
+        "Quickshifter_Task",
+        4096,
+        NULL,
+        2,
+        &quickshifterTaskHandle,
+        1
+    );
+    
+    xTaskCreatePinnedToCore(
+        buttonTask,
+        "Button_Task",
+        2048,
+        NULL,
+        1,
+        &buttonTaskHandle,
+        0
+    );
+    
+    xTaskCreatePinnedToCore(
+        statusUpdateTask,
+        "Status_Task",
+        4096,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+    
+    // Load settings dari EEPROM jika ada
+    loadSettingsFromEEPROM();
+    
+    Serial.println("Sistem siap!");
+}
+
+void loop() {
+    // Main loop dibiarkan kosong karena semua proses ditangani oleh RTOS tasks
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_task_wdt_init(15, true); // Timeout diperpanjang menjadi 15 detik
+
+}
+
+// Fungsi untuk menyimpan settings ke EEPROM
+void saveSettingsToEEPROM() {
+    if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+        int addr = EEPROM_START_ADDR;
+        
+        // Simpan cutoff times
+        for (int i = 0; i < 5; i++) {
+            EEPROM.put(addr, systemState.cutoffTimes[i]);
+            addr += sizeof(uint16_t);
+        }
+        
+        // Simpan sensitivitas
+        EEPROM.put(addr, systemState.sensUp);
+        addr += sizeof(uint8_t);
+        EEPROM.put(addr, systemState.sensDown);
+        addr += sizeof(uint8_t);
+        
+        // Simpan blipper settings
+        EEPROM.put(addr, systemState.blipTime);
+        addr += sizeof(uint8_t);
+        EEPROM.put(addr, systemState.blipAngle);
+        addr += sizeof(uint8_t);
+        
+        // Simpan launch control settings
+        EEPROM.put(addr, systemState.launchRPM);
+        addr += sizeof(uint16_t);
+        EEPROM.put(addr, systemState.launchDelay);
+        addr += sizeof(uint16_t);
+        
+        // Simpan pit limiter settings
+        EEPROM.put(addr, systemState.pitLimiterRPM);
+        addr += sizeof(uint16_t);
+        
+        EEPROM.commit();
+        xSemaphoreGive(systemStateMutex);
+    }
+}
+
+// Fungsi untuk memuat settings dari EEPROM
+void loadSettingsFromEEPROM() {
+    if (xSemaphoreTake(systemStateMutex, portMAX_DELAY)) {
+        int addr = EEPROM_START_ADDR;
+        
+        // Muat cutoff times
+        for (int i = 0; i < 5; i++) {
+            EEPROM.get(addr, systemState.cutoffTimes[i]);
+            addr += sizeof(uint16_t);
+        }
+        
+        // Muat sensitivitas
+        EEPROM.get(addr, systemState.sensUp);
+        addr += sizeof(uint8_t);
+        EEPROM.get(addr, systemState.sensDown);
+        addr += sizeof(uint8_t);
+        
+        // Muat blipper settings
+        EEPROM.get(addr, systemState.blipTime);
+        addr += sizeof(uint8_t);
+        EEPROM.get(addr, systemState.blipAngle);
+        addr += sizeof(uint8_t);
+        
+        // Muat launch control settings
+        EEPROM.get(addr, systemState.launchRPM);
+        addr += sizeof(uint16_t);
+        EEPROM.get(addr, systemState.launchDelay);
+        addr += sizeof(uint16_t);
+        
+        // Muat pit limiter settings
+        EEPROM.get(addr, systemState.pitLimiterRPM);
+        addr += sizeof(uint16_t);
+        
+        xSemaphoreGive(systemStateMutex);
+    }
+}
