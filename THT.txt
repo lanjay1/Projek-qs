@@ -1,0 +1,20 @@
+// Pilih GPIO yang aman dan mudah diakses
+// Rekomendasi: GPIO 2, 4, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33
+
+#define LED_PIN 2     // Ganti dengan pin yang kamu pakai (coba 2 dulu)
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);   // Atur pin sebagai output
+  Serial.begin(115200);       // Opsional, untuk debug di Serial Monitor
+  Serial.println("LED Eksternal siap berkedip...");
+}
+
+void loop() {
+  digitalWrite(LED_PIN, HIGH);  // Nyalakan LED
+  Serial.println("LED ON");
+  delay(1000);                  // Tunggu 1 detik
+
+  digitalWrite(LED_PIN, LOW);   // Matikan LED
+  Serial.println("LED OFF");
+  delay(1000);                  // Tunggu 1 detik
+}
